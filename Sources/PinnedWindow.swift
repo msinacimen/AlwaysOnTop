@@ -172,11 +172,14 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let visible: Bool
         let interactive: Bool
+        var holes: [CGRect] = []
         if app.isHidden {
             (visible, interactive) = (false, false)
         } else {
-            switch placement(of: bounds, in: windowList) {
+            let (position, decorations) = placement(of: bounds, in: windowList)
+            switch position {
             case .front:
+                holes = decorations
                 (visible, interactive) = (!settling, false)
             case .frontWithChildren:
                 (visible, interactive) = (false, false)
@@ -199,31 +202,72 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let frame = Self.cocoaFrame(for: bounds)
         if panel.frame != frame { panel.setFrame(frame, display: true) }
+        setHoles(holes, in: bounds)
         if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
-    private func placement(of bounds: CGRect, in windowList: [[String: Any]]) -> Placement {
+    /// Where the real window sits in the stack, plus any of its own small
+    /// decoration windows above it.
+    private func placement(of bounds: CGRect, in windowList: [[String: Any]]) -> (Placement, decorations: [CGRect]) {
         var hasChildrenAbove = false
+        var decorations: [CGRect] = []
         for info in windowList {
             guard (info[kCGWindowLayer as String] as? Int) == 0 else { continue }
             if (info[kCGWindowNumber as String] as? CGWindowID) == windowID {
-                return hasChildrenAbove ? .frontWithChildren : .front
+                return (hasChildrenAbove ? .frontWithChildren : .front, decorations)
             }
             guard (info[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let other = Self.bounds(of: info), other.width > 1, other.height > 1,
                   other.intersects(bounds) else { continue }
+            guard (info[kCGWindowOwnerPID as String] as? pid_t) == pid else { return (.covered, []) }
 
+            if Self.isDecoration(other, of: bounds) {
+                decorations.append(other)
+                continue
+            }
             // A sheet, popover or dialog from the same app that sits mostly on
             // top of the pinned window belongs to it; the copy must not hide it.
             let overlap = other.intersection(bounds)
-            if (info[kCGWindowOwnerPID as String] as? pid_t) == pid,
-               overlap.width * overlap.height >= 0.5 * other.width * other.height {
+            if overlap.width * overlap.height >= 0.5 * other.width * other.height {
                 hasChildrenAbove = true
                 continue
             }
-            return .covered
+            return (.covered, [])
         }
-        return .offscreen
+        return (.offscreen, [])
+    }
+
+    /// While a window is being captured, macOS draws its close/minimize/zoom
+    /// buttons in a separate small window stacked on top of it (66×20 pt).
+    static func isDecoration(_ other: CGRect, of bounds: CGRect) -> Bool {
+        bounds.insetBy(dx: -1, dy: -1).contains(other) && other.width < 200 && other.height < 60
+    }
+
+    /// Cuts see-through holes in the copy so decoration windows underneath (the
+    /// real window buttons) stay visible while the real window is in front.
+    private var currentHoles: [CGRect] = []
+    private func setHoles(_ holes: [CGRect], in bounds: CGRect) {
+        // Layer coordinates have a bottom-left origin; window server ones top-left.
+        let local = holes.map { CGRect(x: $0.minX - bounds.minX, y: bounds.maxY - $0.maxY,
+                                       width: $0.width, height: $0.height) }
+        guard local != currentHoles else { return }
+        currentHoles = local
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if local.isEmpty {
+            mirror.displayLayer.mask = nil
+        } else {
+            let mask = CAShapeLayer()
+            mask.frame = CGRect(origin: .zero, size: bounds.size)
+            let path = CGMutablePath()
+            path.addRect(mask.frame)
+            for hole in local { path.addRect(hole) }
+            mask.path = path
+            mask.fillRule = .evenOdd
+            mirror.displayLayer.mask = mask
+        }
+        CATransaction.commit()
     }
 
     private func currentPlacement() -> Placement? {
@@ -231,7 +275,7 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
               let bounds = Self.bounds(of: info) else { return nil }
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
-        return placement(of: bounds, in: list)
+        return placement(of: bounds, in: list).0
     }
 
     private static func bounds(of info: [String: Any]) -> CGRect? {

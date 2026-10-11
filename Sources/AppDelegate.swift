@@ -226,11 +226,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // The window list is ordered front to back, so the first normal-layer
         // window owned by the frontmost app is the one the user is looking at.
+        // Skip tiny ones such as the separate button strip macOS adds to
+        // windows being captured.
         let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
         guard let windowID = info.first(where: {
-            ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
-                && ($0[kCGWindowLayer as String] as? Int) == 0
+            guard ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier,
+                  ($0[kCGWindowLayer as String] as? Int) == 0,
+                  let dict = $0[kCGWindowBounds as String],
+                  let bounds = CGRect(dictionaryRepresentation: dict as! CFDictionary) else { return false }
+            return bounds.width >= 60 && bounds.height >= 60
         })?[kCGWindowNumber as String] as? CGWindowID else {
             NSSound.beep()
             return

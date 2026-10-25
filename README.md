@@ -15,7 +15,7 @@ macOS doesn't let one app change the stacking level of another app's windows, so
 
 - Scrolling over a covered pinned window scrolls the real one without switching to it.
 - Sheets, popovers and dialogs of the pinned window show normally.
-- Pinned windows follow you across desktops and over full-screen apps.
+- With **Follow to Other Desktops** on (the default), a pin comes along to other desktops and over full-screen apps as a view only: clicks pass through it there, because macOS doesn't let one app move another app's window between desktops. Turn it off to keep each pin on its window's own desktop. To use a window on every desktop, right-click its app in the Dock and choose Options › Assign To › All Desktops.
 - "Open at Login" is in the menu.
 
 ## Permissions
@@ -41,3 +41,4 @@ If a code-signing identity named **AlwaysOnTop Local Signing** exists in your ke
 - `Sources/AppDelegate.swift` — menu bar UI, window discovery, shortcuts, login item
 - `Sources/PinnedWindow.swift` — capture stream, floating panel, cover detection, click hand-off
 - `Sources/HotKey.swift` — global shortcuts via Carbon (no Accessibility needed)
+- `Sources/Spaces.swift` — which desktop a window is on, via the window server

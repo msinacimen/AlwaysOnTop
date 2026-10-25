@@ -19,7 +19,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let myPID = ProcessInfo.processInfo.processIdentifier
 
+    private static let followsDesktopsKey = "followsDesktops"
+    /// Whether pins come along to other desktops as a view-only copy, or stay
+    /// on their window's own desktop.
+    private var followsDesktops: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.followsDesktopsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.followsDesktopsKey) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: [Self.followsDesktopsKey: true])
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Always On Top")
         statusItem.button?.imagePosition = .imageLeading
@@ -60,15 +69,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { await refreshWindows() }
     }
 
+    /// App, hide and desktop switches are answered at once, including the
+    /// check of which desktop each pinned window is on.
     @objc private func workspaceChanged() {
-        syncPins()
+        syncPins(spaceChanged: true)
     }
 
-    private func syncPins() {
+    private func syncPins(spaceChanged: Bool = false) {
         guard !pins.isEmpty else { return }
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
-        for pin in pins { pin.sync(windowList: list) }
+        let follows = followsDesktops
+        for pin in pins { pin.sync(windowList: list, followsDesktops: follows, spaceChanged: spaceChanged) }
     }
 
     private func updateStatusButton() {
@@ -108,6 +120,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             all.target = self
             menu.addItem(all)
         }
+
+        menu.addItem(.separator())
+        let follow = NSMenuItem(title: "Follow to Other Desktops", action: #selector(toggleFollowsDesktops),
+                                keyEquivalent: "")
+        follow.target = self
+        follow.state = followsDesktops ? .on : .off
+        follow.toolTip = "On other desktops a pin shows as a view only and clicks pass through it. "
+            + "To use a window on every desktop, right-click its app in the Dock and choose "
+            + "Options › Assign To › All Desktops."
+        menu.addItem(follow)
 
         menu.addItem(.separator())
         if captureDenied {
@@ -214,7 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A pinned copy floating over another app looks like the active window,
         // so the one under the pointer wins.
         let mouse = NSEvent.mouseLocation
-        if let hovered = pins.first(where: { $0.panel.isVisible && $0.panel.frame.contains(mouse) }) {
+        if let hovered = pins.first(where: { $0.contains(screenPoint: mouse) }) {
             hovered.close()
             NSSound(named: "Pop")?.play()
             return
@@ -263,7 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !pins.contains(where: { $0.windowID == window.windowID }) else { return }
         if !AXIsProcessTrusted() { showAccessibilityAlert() }
 
-        let pin = PinnedWindow(window: window)
+        let pin = PinnedWindow(window: window, followsDesktops: followsDesktops)
         pin.onClose = { [weak self] closed in
             self?.pins.removeAll { $0 === closed }
         }
@@ -279,6 +301,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 showError("Couldn't pin “\(pin.displayName)”", detail: error.localizedDescription)
             }
         }
+    }
+
+    @objc private func toggleFollowsDesktops() {
+        followsDesktops.toggle()
+        for pin in pins { pin.setFollowsDesktops(followsDesktops) }
+        syncPins(spaceChanged: true)
     }
 
     @objc private func unpinAll() {

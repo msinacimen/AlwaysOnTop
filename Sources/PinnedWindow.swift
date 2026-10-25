@@ -9,8 +9,9 @@ import ScreenCaptureKit
 private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 /// Shows captured frames. It only receives mouse events while the real window
-/// is covered: a click raises the real window and is then replayed on it, and
-/// scrolling is forwarded so the copy can be scrolled without focusing it.
+/// is covered on the same desktop: a click raises the real window and is then
+/// replayed on it, and scrolling is forwarded so the copy can be scrolled
+/// without focusing it.
 final class MirrorView: NSView {
     weak var pin: PinnedWindow?
     let displayLayer = CALayer()
@@ -38,6 +39,12 @@ final class MirrorView: NSView {
 /// the instant something else would cover the window — no flicker. While the
 /// real window is in front the copy is click-through, so the user is always
 /// interacting with the actual app.
+///
+/// When following, the copy also comes along to other desktops, but there it
+/// is only a view: macOS doesn't let one app move another app's window between
+/// desktops, so focusing the real window would switch back to its desktop.
+/// When not following, the copy belongs to the window's own desktop and macOS
+/// slides it in and out with that desktop.
 final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
     enum Placement {
         case front              // nothing above the real window
@@ -58,10 +65,22 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
     private var pixelScale: CGFloat = 2
     private var capturedSize: CGSize
     private var lastBounds: CGRect?
-    private var settledAt = Date.distantPast // when the real window last moved or resized
+    private var settledAt = Date.distantPast // when the user last dragged or resized the real window
     private var clickDownLocation: CGPoint?
     private let frameQueue = DispatchQueue(label: "AlwaysOnTop.frames", qos: .userInteractive)
     private var closed = false
+    private var storedOpacity: CGFloat = 1
+    /// Whether the panel is ordered in. Kept here because AppKit's own answer
+    /// for a panel parked on another desktop isn't one to steer by.
+    private var orderedIn = false
+    private var onHiddenSpace = false
+    private var spaceCheckedAt = Date.distantPast
+
+    /// The desktop check is too costly for every tick; desktop and app
+    /// switches ask again at once.
+    private static let spaceRecheckInterval: TimeInterval = 1
+    private static let settleInterval: TimeInterval = 0.25
+    private static let fadeInDuration: TimeInterval = 0.15
 
     var windowID: CGWindowID { source.windowID }
 
@@ -72,11 +91,14 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     var opacity: CGFloat {
-        get { panel.alphaValue }
-        set { panel.alphaValue = min(1, max(0.15, newValue)) }
+        get { storedOpacity }
+        set {
+            storedOpacity = min(1, max(0.15, newValue))
+            panel.alphaValue = storedOpacity
+        }
     }
 
-    init(window: SCWindow) {
+    init(window: SCWindow, followsDesktops: Bool) {
         source = window
         pid = window.owningApplication?.processID ?? 0
         capturedSize = window.frame.size
@@ -90,16 +112,64 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
 
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false // the real window's shadow shows through while it's in front
         panel.level = .floating
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false // our app is never active, so this must be off
         panel.becomesKeyOnlyIfNeeded = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        panel.collectionBehavior = Self.collectionBehavior(followsDesktops: followsDesktops)
         panel.isReleasedWhenClosed = false
 
         mirror.pin = self
         panel.contentView = mirror
+    }
+
+    /// Whether a point is over this pin's copy on the desktop being shown.
+    func contains(screenPoint: NSPoint) -> Bool {
+        orderedIn && panel.isOnActiveSpace && panel.frame.contains(screenPoint)
+    }
+
+    // MARK: Desktops
+
+    /// Following, the panel joins every desktop. Otherwise it belongs to the
+    /// desktop it was shown on — the window's own — and macOS leaves it there
+    /// during a desktop switch.
+    private static func collectionBehavior(followsDesktops: Bool) -> NSWindow.CollectionBehavior {
+        followsDesktops
+            ? [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+            : [.fullScreenAuxiliary, .ignoresCycle]
+    }
+
+    func setFollowsDesktops(_ follows: Bool) {
+        let behavior = Self.collectionBehavior(followsDesktops: follows)
+        guard panel.collectionBehavior != behavior else { return }
+        panel.collectionBehavior = behavior
+        hide() // shown again on the next sync, on the right desktop
+    }
+
+    /// Asked fresh unless it said "away" moments ago.
+    private func isAwayFromWindowDesktop() -> Bool {
+        if onHiddenSpace, Date().timeIntervalSince(spaceCheckedAt) < Self.spaceRecheckInterval { return true }
+        onHiddenSpace = Spaces.isOnHiddenSpace(windowID)
+        spaceCheckedAt = Date()
+        return onHiddenSpace
+    }
+
+    private func show() {
+        // Fades in rather than popping, so coming back after a drag doesn't
+        // look like the window being pinned again.
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        orderedIn = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.fadeInDuration
+            panel.animator().alphaValue = storedOpacity
+        }
+    }
+
+    private func hide() {
+        panel.orderOut(nil)
+        orderedIn = false
     }
 
     // MARK: Capture
@@ -121,6 +191,10 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
         try await stream.startCapture()
+        guard !closed else { // unpinned while the capture was starting
+            try? await stream.stopCapture()
+            return
+        }
         self.stream = stream
     }
 
@@ -154,29 +228,48 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: Tracking
 
     /// Called many times a second with the on-screen window list (front to back).
-    /// Shows the floating copy only when the real window is covered.
-    func sync(windowList: [[String: Any]]) {
+    /// `spaceChanged` asks for the desktop check now instead of on its interval.
+    func sync(windowList: [[String: Any]], followsDesktops: Bool, spaceChanged: Bool = false) {
         guard !closed else { return }
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
               let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]])?.first,
               let bounds = Self.bounds(of: info)
         else { return close() }
 
+        // Not following, a copy already shown lives on the window's own
+        // desktop. While another desktop is in front there's nothing to do:
+        // macOS keeps it there, and touching it would bring it here.
+        if !followsDesktops, orderedIn, !panel.isOnActiveSpace { return }
+
+        // The window list alone can't tell desktops apart.
+        if spaceChanged || Date().timeIntervalSince(spaceCheckedAt) >= Self.spaceRecheckInterval {
+            onHiddenSpace = Spaces.isOnHiddenSpace(windowID)
+            spaceCheckedAt = Date()
+        }
+
         if bounds.size != capturedSize { resizeCapture(to: bounds.size) }
-        if let lastBounds, lastBounds != bounds { settledAt = Date() }
+        // Step aside briefly while the user drags or resizes the real window,
+        // so a lagging copy isn't drawn over it. Only a move made with a mouse
+        // button down counts: the window server also reports the window moving
+        // while a desktop switch slides it away.
+        if let lastBounds, lastBounds != bounds, NSEvent.pressedMouseButtons != 0 { settledAt = Date() }
         lastBounds = bounds
+        let settling = Date().timeIntervalSince(settledAt) < Self.settleInterval
 
-        // Step aside briefly while the real window is being moved or resized,
-        // so a lagging copy isn't drawn over it.
-        let settling = Date().timeIntervalSince(settledAt) < 0.25
-
+        let (position, decorations) = placement(of: bounds, in: windowList)
+        // Not following, being on another desktop changes nothing: macOS
+        // already keeps the copy with its desktop.
+        let away = onHiddenSpace && followsDesktops
         let visible: Bool
         let interactive: Bool
         var holes: [CGRect] = []
         if app.isHidden {
             (visible, interactive) = (false, false)
+        } else if away {
+            // Another desktop: follow as a view only, unless minimized or full
+            // screen (a full-screen copy would blanket every desktop).
+            (visible, interactive) = (!isMinimized() && !Self.isFullScreen(bounds), false)
         } else {
-            let (position, decorations) = placement(of: bounds, in: windowList)
             switch position {
             case .front:
                 holes = decorations
@@ -186,9 +279,7 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
             case .covered:
                 (visible, interactive) = (true, true)
             case .offscreen:
-                // On another desktop: keep it visible here, unless it's minimized
-                // or full screen (a full-screen copy would blanket every desktop).
-                (visible, interactive) = (!isMinimized() && !NSScreen.screens.contains { $0.frame.size == bounds.size }, true)
+                (visible, interactive) = (!isMinimized() && !Self.isFullScreen(bounds), true)
             }
         }
 
@@ -197,13 +288,26 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
             panel.ignoresMouseEvents = !interactive
         }
         guard visible else {
-            if panel.isVisible { panel.orderOut(nil) }
+            if orderedIn { hide() }
             return
         }
         let frame = Self.cocoaFrame(for: bounds)
         if panel.frame != frame { panel.setFrame(frame, display: true) }
         setHoles(holes, in: bounds)
-        if !panel.isVisible { panel.orderFrontRegardless() }
+        // A second shadow over the real window would darken its edge; the copy
+        // only needs one when it stands on its own.
+        let shadow = position != .front || away
+        if panel.hasShadow != shadow { panel.hasShadow = shadow }
+        if !orderedIn {
+            // Ordering in lands on whichever desktop is in front, so a copy
+            // that stays with its window waits until that's the window's own.
+            if !followsDesktops, isAwayFromWindowDesktop() { return }
+            show()
+        }
+    }
+
+    private static func isFullScreen(_ bounds: CGRect) -> Bool {
+        NSScreen.screens.contains { $0.frame.size == bounds.size }
     }
 
     /// Where the real window sits in the stack, plus any of its own small
@@ -342,6 +446,7 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func replayClick(at point: CGPoint, button: CGMouseButton, deadline: Date) {
+        guard !closed else { return }
         switch currentPlacement() {
         case .front?, .frontWithChildren?:
             // Let the click fall through the copy to the real window underneath.
@@ -379,7 +484,8 @@ final class PinnedWindow: NSObject, SCStreamOutput, SCStreamDelegate {
         closed = true
         if let stream { Task { try? await stream.stopCapture() } }
         stream = nil
-        panel.orderOut(nil)
+        clickDownLocation = nil
+        hide()
         onClose?(self)
     }
 

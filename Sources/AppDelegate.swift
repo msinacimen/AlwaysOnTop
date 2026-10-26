@@ -14,7 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var availableWindows: [SCWindow] = []
     private var captureDenied = false
     private var pins: [PinnedWindow] = [] {
-        didSet { updateStatusButton() }
+        didSet {
+            updateStatusButton()
+            updateSyncTimer()
+        }
     }
 
     private let myPID = ProcessInfo.processInfo.processIdentifier
@@ -54,11 +57,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         }
 
-        // Keep each floating copy in step with its real window.
-        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.syncPins() }
-        RunLoop.main.add(timer, forMode: .common)
-        syncTimer = timer
-
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didHideApplicationNotification,
                      NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification,
@@ -81,6 +79,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             as? [[String: Any]] ?? []
         let follows = followsDesktops
         for pin in pins { pin.sync(windowList: list, followsDesktops: follows, spaceChanged: spaceChanged) }
+    }
+
+    /// Keeps each floating copy in step with its real window, and runs only
+    /// while something is pinned.
+    private func updateSyncTimer() {
+        if pins.isEmpty {
+            syncTimer?.invalidate()
+            syncTimer = nil
+        } else if syncTimer == nil {
+            let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.syncPins() }
+            RunLoop.main.add(timer, forMode: .common)
+            syncTimer = timer
+        }
     }
 
     private func updateStatusButton() {

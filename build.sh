@@ -11,7 +11,8 @@ APP="build/AlwaysOnTop.app"
 BIN="$APP/Contents/MacOS/AlwaysOnTop"
 
 rm -rf "$APP" build/obj
-mkdir -p "$APP/Contents/MacOS" build/obj
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build/obj
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 for arch in arm64 x86_64; do
   swiftc -O -swift-version 5 \
@@ -30,6 +31,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>AlwaysOnTop</string>
   <key>CFBundleDisplayName</key><string>Always On Top</string>
   <key>CFBundleExecutable</key><string>AlwaysOnTop</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>

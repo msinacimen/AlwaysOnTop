@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/macOS-14%2B-black?logo=apple" alt="macOS 14 or newer">
   <img src="https://img.shields.io/badge/Apple%20silicon%20%26%20Intel-universal-4c8dff" alt="Universal: Apple silicon and Intel">
   <img src="https://img.shields.io/badge/Swift-no%20dependencies-F05138?logo=swift&logoColor=white" alt="Swift, no dependencies">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
 </p>
 
 ---
@@ -92,3 +93,7 @@ The icon is drawn in code: `swift Tools/MakeIcon.swift icon.png` renders it at 1
 | `Sources/Spaces.swift` | Which desktop a window is on, via the window server |
 | `Sources/HotKey.swift` | Global shortcuts via Carbon (no Accessibility needed) |
 | `Tools/MakeIcon.swift` | Draws the app icon |
+
+## License
+
+[MIT](LICENSE) © 2026 Muhammed Sina Çimen
